@@ -23,7 +23,7 @@ PUMP_MIN_PCT     = 15.0
 PUMP_MIN_CANDLES = 4
 PUMP_MAX_CANDLES = 9
 INTERVAL         = "30"
-SLEEP_MIN        = 30
+SLEEP_MIN        = 5
 CANDLES          = 250
 MAX_WORKERS      = 15
 
