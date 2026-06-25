@@ -1,6 +1,6 @@
 # ============================================
-# Bybit Bot v2.0 — Финальная версия
-# Логика: Живые монеты → Пик → Откат → Сигнал
+# Bybit Bot — Памп + Откат
+# Пик 92-99% + рост 15%+ за 4-9 свечей → откат 70-79%
 # ============================================
 
 import requests
@@ -11,24 +11,19 @@ import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-TELEGRAM_TOKEN   = "8288068435:AAEjcmuYidV10__jrZQN0Qieq6ZeV5laVHs"
-TELEGRAM_ID      = "7495689566"
+TELEGRAM_TOKEN = "8288068435:AAEjcmuYidV10__jrZQN0Qieq6ZeV5laVHs"
+TELEGRAM_ID    = "7495689566"
 
-# ШАГ 1 — Фильтры живых монет
-MIN_TURNOVER     = 5_000_000   # $5M оборот за 24ч
-MIN_CHANGE_24H   = 20.0        # +20% рост за 24ч
-
-# ШАГ 2 — Пик индекса
 PEAK_MIN         = 92
 PEAK_MAX         = 99
-PEAK_LOOKBACK    = 11          # 11 свечей = 5.5 часов
-
-# ШАГ 3 — Зона отката
+PEAK_LOOKBACK    = 10
 ZONE_LOW         = 70
 ZONE_HIGH        = 79
-
+PUMP_MIN_PCT     = 15.0
+PUMP_MIN_CANDLES = 4
+PUMP_MAX_CANDLES = 9
 INTERVAL         = "30"
-SLEEP_MIN        = 30
+SLEEP_MIN        = 10
 CANDLES          = 250
 MAX_WORKERS      = 15
 
@@ -77,21 +72,21 @@ def get_candles(symbol):
         return df.iloc[::-1].reset_index(drop=True)
     except: return None
 
-def get_ticker_info(symbol):
+def get_24h_change(symbol):
     url = "https://api.bybit.com/v5/market/tickers"
     params = {"category":"linear","symbol":symbol}
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        if r.status_code != 200: return None, None
+        if r.status_code != 200: return None
         data = r.json()
-        if data.get("retCode") != 0: return None, None
+        if data.get("retCode") != 0: return None
         item = data["result"]["list"][0]
         price24h = float(item.get("prevPrice24h", 0))
-        last     = float(item.get("lastPrice", 0))
-        turnover = float(item.get("turnover24h", 0))
-        change   = round((last - price24h) / price24h * 100, 2) if price24h > 0 else None
-        return change, turnover
-    except: return None, None
+        last = float(item.get("lastPrice", 0))
+        if price24h > 0:
+            return round((last - price24h) / price24h * 100, 2)
+        return None
+    except: return None
 
 def calc_index_series(df):
     try:
@@ -120,37 +115,53 @@ def calc_index_series(df):
     except: return None
 
 def check_pair(symbol):
-    # ШАГ 1 — Фильтр живых монет
-    change_24h, turnover = get_ticker_info(symbol)
-    if turnover is None or turnover < MIN_TURNOVER: return None
-    if change_24h is None or change_24h < MIN_CHANGE_24H: return None
-
-    # ШАГ 2 — Получаем свечи и считаем индекс
     df = get_candles(symbol)
     if df is None or len(df) < 150: return None
+
     index_series = calc_index_series(df)
     if index_series is None: return None
 
     idx_current = round(index_series.iloc[-1], 1)
     price = df["close"].iloc[-1]
 
-    # ШАГ 3 — Текущий индекс в зоне отката 70-79%
     if not (ZONE_LOW <= idx_current <= ZONE_HIGH): return None
 
-    # ШАГ 4 — Ищем пик 92-99% за последние 11 свечей
     recent_idx = index_series.iloc[-(PEAK_LOOKBACK+1):-1]
     peak_mask = (recent_idx >= PEAK_MIN) & (recent_idx <= PEAK_MAX)
     if not peak_mask.any(): return None
 
     peak_value = recent_idx[peak_mask].max()
-    last_peak_pos = recent_idx[peak_mask].index.tolist()[-1]
+    peak_positions = recent_idx[peak_mask].index.tolist()
+    last_peak_pos = peak_positions[-1]
     candles_ago = len(df) - 1 - last_peak_pos
 
-    # ШАГ 5 — Текущий индекс ниже пика (реальный откат)
     if idx_current >= peak_value: return None
 
-    change_str   = f"+{change_24h}%"
-    turnover_str = f"${round(turnover/1_000_000, 1)}M"
+    peak_candle_i = last_peak_pos
+    pump_found = False
+    pump_pct = 0
+    pump_candles = 0
+
+    for window in range(PUMP_MIN_CANDLES, PUMP_MAX_CANDLES + 1):
+        start_i = peak_candle_i - window
+        if start_i < 0: break
+        price_start = df["close"].iloc[start_i]
+        price_peak  = df["close"].iloc[peak_candle_i]
+        if price_start <= 0: continue
+        growth = (price_peak - price_start) / price_start * 100
+        if growth >= PUMP_MIN_PCT:
+            pump_found = True
+            pump_pct = round(growth, 1)
+            pump_candles = window
+            break
+
+    if not pump_found: return None
+
+    change_24h = get_24h_change(symbol)
+    change_str = f"+{change_24h}%" if change_24h and change_24h > 0 else (f"{change_24h}%" if change_24h else "н/д")
+
+    pump_time = pump_candles * 30
+    pump_time_str = f"{pump_candles} свечей ({pump_time} мин)"
 
     return {
         "symbol": symbol,
@@ -158,8 +169,9 @@ def check_pair(symbol):
         "idx_current": idx_current,
         "peak_value": round(peak_value, 1),
         "candles_ago": candles_ago,
+        "pump_pct": pump_pct,
+        "pump_time_str": pump_time_str,
         "change_24h": change_str,
-        "turnover": turnover_str,
     }
 
 def listen_commands():
@@ -174,15 +186,13 @@ def listen_commands():
                 text = upd.get("message", {}).get("text", "")
                 if text == "/status":
                     uptime = datetime.now() - bot_status["start_time"]
-                    h = uptime.seconds // 3600
-                    m = (uptime.seconds % 3600) // 60
+                    h = uptime.seconds // 3600; m = (uptime.seconds % 3600) // 60
                     send_telegram(
                         f"✅ <b>Бот работает!</b>\n\n"
                         f"⏱ Аптайм: {h}ч {m}мин\n"
                         f"🔄 Циклов: {bot_status['cycles_done']}\n"
-                        f"📊 Пар проверено: {bot_status['pairs_checked']}/{bot_status['total_pairs']}\n"
+                        f"📊 Пар: {bot_status['pairs_checked']}/{bot_status['total_pairs']}\n"
                         f"🚀 Сигналов: {bot_status['signals_sent']}\n"
-                        f"💹 Фильтры: оборот ${MIN_TURNOVER//1_000_000}M+ | рост +{MIN_CHANGE_24H}%+\n"
                         f"🕐 Последняя проверка: {bot_status['last_check'] or 'ещё не было'}"
                     )
         except: time.sleep(5)
@@ -190,11 +200,9 @@ def listen_commands():
 def main():
     threading.Thread(target=listen_commands, daemon=True).start()
     send_telegram(
-        "🚀 Бот v2.0 запущен!\n\n"
-        "Шаг 1: Оборот $5M+ И рост +20% за 24ч\n"
-        "Шаг 2: Пик индекса 92-99% (за 5.5 часов)\n"
-        "Шаг 3: Откат в зону 70-79%\n"
-        "Шаг 4: Сигнал в Telegram\n\n"
+        "🚀 Бот запущен! (Памп + Откат)\n"
+        "Пик 92-99% + рост 15%+ за 4-9 свечей → откат 70-79%\n"
+        "Таймфрейм: 30 минут\n\n"
         "Напиши /status для проверки"
     )
 
@@ -226,18 +234,18 @@ def main():
                 msg = (
                     f"🚀 ПАМП СИГНАЛ — LONG\n\n"
                     f"Монета: <b>{symbol}</b>\n\n"
-                    f"Рост за 24 часа: <b>{result['change_24h']}</b>\n"
-                    f"Оборот 24ч: <b>{result['turnover']}</b>\n\n"
+                    f"Рост за 24 часа: <b>{result['change_24h']}</b>\n\n"
                     f"Пик индекса: <b>{result['peak_value']}%</b>\n"
                     f"Текущий индекс: <b>{result['idx_current']}%</b>\n\n"
                     f"Пик был: <b>{result['candles_ago']} свечи назад</b>\n\n"
+                    f"Памп: <b>+{result['pump_pct']}%</b> за {result['pump_time_str']}\n\n"
                     f"Текущая цена: <b>{result['price']}</b>\n\n"
                     f"Таймфрейм: 30 минут"
                 )
                 send_telegram(msg)
                 bot_status["signals_sent"] += 1
                 alerted[symbol] = result["idx_current"]
-                print(f"🚀 СИГНАЛ: {symbol} пик={result['peak_value']}% текущий={result['idx_current']}%")
+                print(f"🚀 ПАМП СИГНАЛ: {symbol} памп={result['pump_pct']}% пик={result['peak_value']}%")
 
         elapsed = round(time.time() - start, 1)
         bot_status["last_check"] = datetime.now().strftime("%H:%M:%S")
