@@ -27,7 +27,7 @@ PEAK_LOOKBACK    = 11          # 11 свечей = 5.5 часов
 ZONE_LOW         = 70
 ZONE_HIGH        = 79
 
-INTERVAL         = "10"
+INTERVAL         = "30"
 SLEEP_MIN        = 30
 CANDLES          = 250
 MAX_WORKERS      = 15
