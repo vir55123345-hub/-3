@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-TELEGRAM_TOKEN   = "8288068435:AAEjcmuYidV10__jrZQN0Qieq6ZeV5laVHs"
+TELEGRAM_TOKEN   = "8288068435:AAHac-ZJX5APqP4x8RiBVT3ZlCTf0Zgx3F4"
 TELEGRAM_ID      = "7495689566"
 
 # ШАГ 1 — Фильтры живых монет
