@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-TELEGRAM_TOKEN   = "8288068435:AAHac-ZJX5APqP4x8RiBVT3ZlCTf0Zgx3F4"
+TELEGRAM_TOKEN   = "8288068435:AAF3ohIl5tBdtJJSsfO0Ie_bfd_lD6FLv0w"
 TELEGRAM_ID      = "7495689566"
 
 # ШАГ 1 — Фильтры живых монет
@@ -27,7 +27,7 @@ PEAK_LOOKBACK    = 11          # 11 свечей = 5.5 часов
 ZONE_LOW         = 70
 ZONE_HIGH        = 79
 
-INTERVAL         = "30"
+INTERVAL         = "120"
 SLEEP_MIN        = 10
 CANDLES          = 250
 MAX_WORKERS      = 15
