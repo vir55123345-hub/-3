@@ -1,156 +1,227 @@
-# ============================================
-# Bybit Bot v2.0 — Финальная версия
-# Логика: Живые монеты → Пик → Откат → Сигнал
-# ============================================
-
-import requests
-import pandas as pd
-import numpy as np
+import os
 import time
 import threading
+import requests
+import numpy as np
+import pandas as pd
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-TELEGRAM_TOKEN   = "8288068435:AAF3ohIl5tBdtJJSsfO0Ie_bfd_lD6FLv0w"
-TELEGRAM_ID      = "7495689566"
+# ============================================================
+# ВЕРСИЯ: таймфрейм 30 минут
+# Быстрее реагирует, но по рекомендации автора индикатора
+# INTELLECT_city на низких ТФ больше шума / ложных сигналов.
+# ============================================================
 
-# ШАГ 1 — Фильтры живых монет
-MIN_TURNOVER     = 5_000_000   # $5M оборот за 24ч
-MIN_CHANGE_24H   = 20.0        # +20% рост за 24ч
+TELEGRAM_TOKEN = os.getenv("8288068435:AAF3ohIl5tBdtJJSsfO0Ie_bfd_lD6FLv0w", "")
+TELEGRAM_ID = os.getenv("7495689566", "")
 
-# ШАГ 2 — Пик индекса
-PEAK_MIN         = 92
-PEAK_MAX         = 99
-PEAK_LOOKBACK    = 11          # 11 свечей = 5.5 часов
+if not TELEGRAM_TOKEN or not TELEGRAM_ID:
+    raise SystemExit(
+        "Не заданы TELEGRAM_TOKEN / TELEGRAM_CHAT_ID. "
+        "Установи переменные окружения перед запуском (см. инструкцию)."
+    )
 
-# ШАГ 3 — Зона отката
-ZONE_LOW         = 70
-ZONE_HIGH        = 79
+# --- Фильтры живых монет ---
+MIN_TURNOVER = 5_000_000      # Оборот $5M+
+MIN_CHANGE_24H = 20.0         # Рост +20%+ за 24ч
 
-INTERVAL         = "30"
-SLEEP_MIN        = 10
-CANDLES          = 250
-MAX_WORKERS      = 15
+# --- Пик / откат индекса ---
+PEAK_MIN = 92.0
+PEAK_MAX = 99.0
+ZONE_LOW = 70.0
+ZONE_HIGH = 79.0
+
+# --- Таймфрейм-специфичные параметры ---
+INTERVAL = "30"                # 30-минутные свечи
+PEAK_LOOKBACK = 11             # 11 свечей × 30 мин = 5.5 часа окно поиска пика
+CANDLES = 250                  # 250 × 30 мин ≈ 5.2 дня истории
+SLEEP_MIN = 10                 # проверяем каждые 10 мин (новая свеча каждые 30 мин)
+
+MAX_WORKERS = 10
+RETRIES = 3
+RETRY_DELAY = 5
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
 bot_status = {
-    "start_time": datetime.now(), "last_check": None,
-    "pairs_checked": 0, "total_pairs": 0,
-    "cycles_done": 0, "last_update_id": 0,
-    "signals_sent": 0
+    "start_time": datetime.now(),
+    "last_check": None,
+    "pairs_checked": 0,
+    "total_pairs": 0,
+    "cycles_done": 0,
+    "last_update_id": 0,
+    "signals_sent": 0,
+    "last_error": None,
 }
 
-def send_telegram(message):
+
+def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_ID, "text": message, "parse_mode": "HTML"}
-    try: requests.post(url, json=payload, timeout=10)
-    except: pass
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[Telegram] Ошибка отправки: {e}")
 
-def get_all_pairs():
-    url = "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-    for _ in range(3):
+
+def get_hot_tickers():
+    url = "https://api.bybit.com/v5/market/tickers?category=linear"
+
+    for attempt in range(1, RETRIES + 1):
         try:
             r = requests.get(url, headers=HEADERS, timeout=15)
-            if r.status_code != 200: time.sleep(5); continue
+            if r.status_code != 200:
+                print(f"[get_hot_tickers] HTTP {r.status_code}, попытка {attempt}/{RETRIES}")
+                time.sleep(RETRY_DELAY)
+                continue
+
             data = r.json()
-            if data.get("retCode") != 0: time.sleep(5); continue
-            return [i["symbol"] for i in data["result"]["list"]
-                    if i["quoteCoin"] == "USDT" and i["status"] == "Trading"]
-        except: time.sleep(5)
+            if data.get("retCode") != 0:
+                print(f"[get_hot_tickers] retCode={data.get('retCode')}, попытка {attempt}/{RETRIES}")
+                time.sleep(RETRY_DELAY)
+                continue
+
+            qualified = []
+            for item in data["result"]["list"]:
+                symbol = item.get("symbol", "")
+                if not symbol.endswith("USDT"):
+                    continue
+
+                price24h = float(item.get("prevPrice24h", 0) or 0)
+                last = float(item.get("lastPrice", 0) or 0)
+                turnover = float(item.get("turnover24h", 0) or 0)
+
+                if price24h <= 0 or turnover < MIN_TURNOVER:
+                    continue
+
+                change = round((last - price24h) / price24h * 100, 2)
+                if change >= MIN_CHANGE_24H:
+                    qualified.append({
+                        "symbol": symbol,
+                        "change_24h": change,
+                        "turnover": turnover
+                    })
+            return qualified
+
+        except Exception as e:
+            print(f"[get_hot_tickers] Исключение: {e}, попытка {attempt}/{RETRIES}")
+            time.sleep(RETRY_DELAY)
+
+    bot_status["last_error"] = f"get_hot_tickers failed at {datetime.now()}"
     return []
 
-def get_candles(symbol):
+
+def get_candles(symbol: str):
     url = "https://api.bybit.com/v5/market/kline"
-    params = {"category":"linear","symbol":symbol,"interval":INTERVAL,"limit":CANDLES}
+    params = {"category": "linear", "symbol": symbol, "interval": INTERVAL, "limit": CANDLES}
+
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+            if r.status_code != 200:
+                time.sleep(1)
+                continue
+
+            data = r.json()
+            if data.get("retCode") != 0:
+                return None
+
+            candles = data["result"]["list"]
+            if not candles:
+                return None
+
+            df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume", "turnover"])
+            df = df.astype({"open": "float", "high": "float", "low": "float", "close": "float", "volume": "float"})
+            return df.iloc[::-1].reset_index(drop=True)
+
+        except Exception:
+            time.sleep(1)
+
+    return None
+
+
+def calc_index_series(df: pd.DataFrame):
+    """Композитный индекс: RSI + Stoch%K + ROSC + WPR + %Rank + MFI + MACD + JAP,
+    по образцу индикатора INTELLECT_city - index inside %."""
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        if r.status_code != 200: return None
-        data = r.json()
-        if data.get("retCode") != 0: return None
-        candles = data["result"]["list"]
-        if not candles: return None
-        df = pd.DataFrame(candles, columns=["time","open","high","low","close","volume","turnover"])
-        df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
-        return df.iloc[::-1].reset_index(drop=True)
-    except: return None
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        volume = df["volume"]
+        n = 14
 
-def get_ticker_info(symbol):
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category":"linear","symbol":symbol}
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        if r.status_code != 200: return None, None
-        data = r.json()
-        if data.get("retCode") != 0: return None, None
-        item = data["result"]["list"][0]
-        price24h = float(item.get("prevPrice24h", 0))
-        last     = float(item.get("lastPrice", 0))
-        turnover = float(item.get("turnover24h", 0))
-        change   = round((last - price24h) / price24h * 100, 2) if price24h > 0 else None
-        return change, turnover
-    except: return None, None
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(n).mean()
+        loss = (-delta.clip(upper=0)).rolling(n).mean()
+        rsi = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
 
-def calc_index_series(df):
-    try:
-        close=df["close"]; high=df["high"]; low=df["low"]; volume=df["volume"]; n=14
-        delta=close.diff()
-        gain=delta.clip(lower=0).rolling(n).mean()
-        loss=(-delta.clip(upper=0)).rolling(n).mean()
-        rsi=100-(100/(1+gain/loss.replace(0,np.nan)))
-        low_n=low.rolling(n).min(); high_n=high.rolling(n).max()
-        stoch=100*(close-low_n)/(high_n-low_n).replace(0,np.nan)
-        wpr=100+(100*(close-high_n)/(high_n-low_n).replace(0,np.nan))
-        hlc3=(high+low+close)/3; mf=hlc3*volume
-        pos_mf=mf.where(hlc3>hlc3.shift(1),0).rolling(n).sum()
-        neg_mf=mf.where(hlc3<hlc3.shift(1),0).rolling(n).sum()
-        mfi=100-(100/(1+pos_mf/neg_mf.replace(0,np.nan)))
-        idx_s=pd.Series(range(len(close)))
-        rosc=(close.rolling(n).corr(idx_s)+1)/2*100
-        rank=close.rolling(100).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1]*100)
-        ema12=close.ewm(span=12).mean(); ema26=close.ewm(span=26).mean()
-        macd=ema12-ema26; sig=macd.ewm(span=9).mean()
-        diff=macd-sig; dmax=diff.abs().rolling(100).max()
-        macd_n=50+(diff/dmax.replace(0,np.nan))*50
-        body=(close-df["open"]).abs(); rng=(high-low).replace(0,np.nan)
-        jap=pd.Series(np.where(close>df["open"],body/rng*100,(1-body/rng)*100),index=close.index)
-        return (rsi+stoch+rosc+wpr+rank+mfi+macd_n+jap)/8
-    except: return None
+        low_n = low.rolling(n).min()
+        high_n = high.rolling(n).max()
+        stoch = 100 * (close - low_n) / (high_n - low_n).replace(0, np.nan)
+        wpr = 100 + (100 * (close - high_n) / (high_n - low_n).replace(0, np.nan))
 
-def check_pair(symbol):
-    # ШАГ 1 — Фильтр живых монет
-    change_24h, turnover = get_ticker_info(symbol)
-    if turnover is None or turnover < MIN_TURNOVER: return None
-    if change_24h is None or change_24h < MIN_CHANGE_24H: return None
+        hlc3 = (high + low + close) / 3
+        mf = hlc3 * volume
+        pos_mf = mf.where(hlc3 > hlc3.shift(1), 0).rolling(n).sum()
+        neg_mf = mf.where(hlc3 < hlc3.shift(1), 0).rolling(n).sum()
+        mfi = 100 - (100 / (1 + pos_mf / neg_mf.replace(0, np.nan)))
 
-    # ШАГ 2 — Получаем свечи и считаем индекс
+        idx_s = pd.Series(range(len(close)), index=close.index)
+        rosc = ((close.rolling(n).corr(idx_s) + 1) / 2) * 100
+        rank = close.rolling(100).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100)
+
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd = ema12 - ema26
+        sig = macd.ewm(span=9).mean()
+        diff = macd - sig
+        dmax = diff.abs().rolling(100).max().replace(0, np.nan)
+        macd_n = 50 + (diff / dmax) * 50
+
+        body = (close - df["open"]).abs()
+        rng = (high - low).replace(0, np.nan)
+        jap = pd.Series(np.where(close > df["open"], (body / rng) * 100, (1 - (body / rng)) * 100), index=close.index)
+
+        composite = (rsi + stoch + rosc + wpr + rank + mfi + macd_n + jap) / 8
+        return composite
+    except Exception as e:
+        print(f"[calc_index_series] Ошибка: {e}")
+        return None
+
+
+def check_pair(item: dict):
+    symbol = item["symbol"]
     df = get_candles(symbol)
-    if df is None or len(df) < 150: return None
-    index_series = calc_index_series(df)
-    if index_series is None: return None
+    if df is None or len(df) < 150:
+        return None
 
-    idx_current = round(index_series.iloc[-1], 1)
+    index_series = calc_index_series(df)
+    if index_series is None:
+        return None
+
+    idx_current = index_series.iloc[-1]
+    if pd.isna(idx_current):
+        return None
+    idx_current = round(idx_current, 1)
     price = df["close"].iloc[-1]
 
-    # ШАГ 3 — Текущий индекс в зоне отката 70-79%
-    if not (ZONE_LOW <= idx_current <= ZONE_HIGH): return None
+    if not (ZONE_LOW <= idx_current <= ZONE_HIGH):
+        return None
 
-    # ШАГ 4 — Ищем пик 92-99% за последние 11 свечей
-    recent_idx = index_series.iloc[-(PEAK_LOOKBACK+1):-1]
+    recent_idx = index_series.iloc[-(PEAK_LOOKBACK + 1):-1]
     peak_mask = (recent_idx >= PEAK_MIN) & (recent_idx <= PEAK_MAX)
-    if not peak_mask.any(): return None
+    if not peak_mask.any():
+        return None
 
     peak_value = recent_idx[peak_mask].max()
-    last_peak_pos = recent_idx[peak_mask].index.tolist()[-1]
+    last_peak_pos = recent_idx[peak_mask].index[-1]
     candles_ago = len(df) - 1 - last_peak_pos
 
-    # ШАГ 5 — Текущий индекс ниже пика (реальный откат)
-    if idx_current >= peak_value: return None
-
-    change_str   = f"+{change_24h}%"
-    turnover_str = f"${round(turnover/1_000_000, 1)}M"
+    if idx_current >= peak_value:
+        return None
 
     return {
         "symbol": symbol,
@@ -158,9 +229,10 @@ def check_pair(symbol):
         "idx_current": idx_current,
         "peak_value": round(peak_value, 1),
         "candles_ago": candles_ago,
-        "change_24h": change_str,
-        "turnover": turnover_str,
+        "change_24h": f"+{item['change_24h']}%",
+        "turnover": f"${round(item['turnover'] / 1_000_000, 1)}M"
     }
+
 
 def listen_commands():
     while True:
@@ -176,26 +248,30 @@ def listen_commands():
                     uptime = datetime.now() - bot_status["start_time"]
                     h = uptime.seconds // 3600
                     m = (uptime.seconds % 3600) // 60
+                    err_line = f"\n⚠️ Последняя ошибка API: {bot_status['last_error']}" if bot_status["last_error"] else ""
                     send_telegram(
-                        f"✅ <b>Бот работает!</b>\n\n"
+                        f"✅ <b>Бот работает! (ТФ 30м)</b>\n\n"
                         f"⏱ Аптайм: {h}ч {m}мин\n"
                         f"🔄 Циклов: {bot_status['cycles_done']}\n"
-                        f"📊 Пар проверено: {bot_status['pairs_checked']}/{bot_status['total_pairs']}\n"
-                        f"🚀 Сигналов: {bot_status['signals_sent']}\n"
-                        f"💹 Фильтры: оборот ${MIN_TURNOVER//1_000_000}M+ | рост +{MIN_CHANGE_24H}%+\n"
+                        f"📊 Горячих пар: {bot_status['pairs_checked']}/{bot_status['total_pairs']}\n"
+                        f"🚀 Сигналов отправлено: {bot_status['signals_sent']}\n"
+                        f"💹 Фильтры: оборот ${MIN_TURNOVER // 1_000_000}M+ | рост +{MIN_CHANGE_24H}%+\n"
                         f"🕐 Последняя проверка: {bot_status['last_check'] or 'ещё не было'}"
+                        f"{err_line}"
                     )
-        except: time.sleep(5)
+        except Exception as e:
+            print(f"[listen_commands] {e}")
+            time.sleep(5)
+
 
 def main():
     threading.Thread(target=listen_commands, daemon=True).start()
     send_telegram(
-        "🚀 Бот v2.0 запущен!\n\n"
-        "Шаг 1: Оборот $5M+ И рост +20% за 24ч\n"
-        "Шаг 2: Пик индекса 92-99% (за 5.5 часов)\n"
-        "Шаг 3: Откат в зону 70-79%\n"
-        "Шаг 4: Сигнал в Telegram\n\n"
-        "Напиши /status для проверки"
+        "🚀 <b>Бот запущен (ТФ 30 минут)!</b>\n\n"
+        "• Шаг 1: Оборот $5M+ И рост +20% за 24ч\n"
+        "• Шаг 2: Пик индекса 92-99% (за 5.5 ч)\n"
+        "• Шаг 3: Откат в зону 70-79%\n"
+        "• Шаг 4: Сигнал в Telegram"
     )
 
     alerted = {}
@@ -203,47 +279,59 @@ def main():
     while True:
         now = datetime.now().strftime("%H:%M")
         start = time.time()
-        print(f"[{now}] Проверяю пары...")
 
-        pairs = get_all_pairs()
-        if not pairs: time.sleep(120); continue
-        bot_status["total_pairs"] = len(pairs)
-        print(f"Найдено пар: {len(pairs)}")
+        hot_pairs = get_hot_tickers()
+        bot_status["total_pairs"] = len(hot_pairs)
+        print(f"[{now}] Отобрано горячих пар: {len(hot_pairs)}")
+
+        if not hot_pairs:
+            print("⚠️ Пустой список пар (проблема с API?), короткая пауза перед повтором.")
+            time.sleep(60)
+            continue
 
         checked = 0
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(check_pair, s): s for s in pairs}
+            futures = {executor.submit(check_pair, item): item for item in hot_pairs}
             for future in as_completed(futures):
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print(f"[check_pair] Ошибка в потоке: {e}")
+                    result = None
+
                 checked += 1
                 bot_status["pairs_checked"] = checked
-                if result is None: continue
+
+                if result is None:
+                    continue
 
                 symbol = result["symbol"]
-                prev = alerted.get(symbol, 100)
-                if prev <= ZONE_HIGH: continue
+
+                if symbol in alerted and alerted[symbol] <= ZONE_HIGH:
+                    continue
 
                 msg = (
-                    f"🚀 ПАМП СИГНАЛ — LONG\n\n"
-                    f"Монета: <b>{symbol}</b>\n\n"
-                    f"Рост за 24 часа: <b>{result['change_24h']}</b>\n"
+                    f"🚀 <b>ПАМП СИГНАЛ — LONG (Откат, ТФ 30м)</b>\n\n"
+                    f"Монета: <b>{symbol}</b>\n"
+                    f"Рост 24ч: <b>{result['change_24h']}</b>\n"
                     f"Оборот 24ч: <b>{result['turnover']}</b>\n\n"
                     f"Пик индекса: <b>{result['peak_value']}%</b>\n"
-                    f"Текущий индекс: <b>{result['idx_current']}%</b>\n\n"
-                    f"Пик был: <b>{result['candles_ago']} свечи назад</b>\n\n"
+                    f"Текущий индекс: <b>{result['idx_current']}%</b>\n"
+                    f"Пик был: <b>{result['candles_ago']} свечи назад</b>\n"
                     f"Текущая цена: <b>{result['price']}</b>\n\n"
-                    f"Таймфрейм: 30 минут"
+                    f"⏱ Таймфрейм: 30 минут"
                 )
                 send_telegram(msg)
                 bot_status["signals_sent"] += 1
                 alerted[symbol] = result["idx_current"]
-                print(f"🚀 СИГНАЛ: {symbol} пик={result['peak_value']}% текущий={result['idx_current']}%")
+                print(f"🚀 СИГНАЛ: {symbol} (Индекс: {result['idx_current']}%)")
 
         elapsed = round(time.time() - start, 1)
         bot_status["last_check"] = datetime.now().strftime("%H:%M:%S")
         bot_status["cycles_done"] += 1
-        print(f"✅ Завершено за {elapsed} сек. Жду {SLEEP_MIN} минут...\n")
+        print(f"✅ Проверка завершена за {elapsed} сек. Пауза {SLEEP_MIN} мин...\n")
         time.sleep(SLEEP_MIN * 60)
+
 
 if __name__ == "__main__":
     main()
