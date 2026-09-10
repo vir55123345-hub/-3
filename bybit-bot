@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # INTELLECT_city на низких ТФ больше шума / ложных сигналов.
 # ============================================================
 
-TELEGRAM_TOKEN = os.getenv("8288068435:AAF3ohIl5tBdtJJSsfO0Ie_bfd_lD6FLv0w", "")
+TELEGRAM_TOKEN = os.getenv("8288068435:AAFStJROdw89XGqeG0ZGOrStQIjRVU77fh0", "")
 TELEGRAM_ID = os.getenv("7495689566", "")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_ID:
